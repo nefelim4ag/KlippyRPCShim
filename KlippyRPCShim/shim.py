@@ -7,9 +7,28 @@ import socket
 import threading
 from queue import Queue
 
+from .exceptions import SocketClosed
+
 def _set_thread_name(name):
     libc = ctypes.CDLL('libc.so.6')
     libc.prctl(15, name.encode())
+
+class _SockWrap():
+    def __init__(self, sock):
+        self._sock = sock
+        self._is_running = True
+    def recv(self, size):
+        resp = self._sock.recv(size)
+        if len(resp) == 0 and self._is_running:
+            raise SocketClosed("Klippy restart")
+        return resp
+    def sendall(self, data):
+        return self._sock.sendall(data)
+    def shutdown(self, flags):
+        self._is_running = False
+        return self._sock.shutdown(flags)
+    def close(self):
+        self._sock.close()
 
 class KlippyRPCShim:
     def __init__(self, socket_path=None):
@@ -42,7 +61,7 @@ class KlippyRPCShim:
     def _new_connection(self):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(self._socket_path)
-        return sock
+        return _SockWrap(sock)
     def _stream_decoder(self, stream):
         buf = ""
         while True:
@@ -61,17 +80,22 @@ class KlippyRPCShim:
             pass
     def _reader(self):
         _set_thread_name("reader")
-        for response in self._stream_decoder(self._sock):
-            id_value = response.get("id", None)
-            if not self._is_running:
-                return
-            with self._lock:
-                if id_value in self._inflight:
-                    self._inflight[id_value].put(response)
-            action = response.get("remote_method", None)
-            params = response.get("params", None)
-            if action in self._actions:
-                self._actions[action](params)
+        try:
+            for response in self._stream_decoder(self._sock):
+                id_value = response.get("id", None)
+                if not self._is_running:
+                    return
+                with self._lock:
+                    if id_value in self._inflight:
+                        self._inflight[id_value].put((response, None))
+                action = response.get("remote_method", None)
+                params = response.get("params", None)
+                if action in self._actions:
+                    self._actions[action](params)
+        except SocketClosed as e:
+            for k in self._inflight:
+                self._inflight[k].put((None, error))
+            raise e
     def _verify_id(self, request):
         if request.get("id") is None:
             with self._lock:
@@ -98,7 +122,9 @@ class KlippyRPCShim:
             self._inflight[id_value] = Queue(1)
         self._socket_write(req_json)
         def promise():
-            response = self._inflight[id_value].get()
+            response, error = self._inflight[id_value].get()
+            if error is not None:
+                raise error
             with self._lock:
                 del self._inflight[id_value]
             return response
